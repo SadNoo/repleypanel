@@ -1,0 +1,13 @@
+.DS_Store
+._*
+
+*.db
+*.sqlite
+*.sqlite3
+
+/backend/repleypass-api
+/backend/repleypass.db
+/agent/repleypass-agent
+
+/dist/
+/tmp/
