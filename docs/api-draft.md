@@ -170,6 +170,40 @@ Authorization: Bearer <agent_token>
 }
 ```
 
+单条规则下发结构：
+
+```json
+{
+  "role": "entry",
+  "mode": "reverse_tunnel",
+  "entry": {
+    "enabled": true,
+    "listenHost": "",
+    "listenPort": "20000",
+    "listenAddr": ":20000",
+    "protocol": "reverse"
+  },
+  "exit": {
+    "enabled": false,
+    "targetHost": "target.example.com",
+    "targetPort": "443",
+    "targetAddr": "target.example.com:443"
+  },
+  "tunnel": {
+    "enabled": true,
+    "peerPolicy": "first_online",
+    "peerDeviceIds": [2]
+  },
+  "rule": {}
+}
+```
+
+- `role`: 当前设备在该规则中的角色，取值为 `entry`、`exit`、`entry_exit`。
+- `mode`: 转发模式，取值为 `direct`、`reverse_tunnel`、`exit_only`。
+- `entry`: 入口侧监听配置。只有入口角色需要启动监听。
+- `exit`: 出口侧目标配置。`targetAddr` 是出口节点拨最终目标时使用的地址。
+- `tunnel`: 控制面中继配置。`reverse_tunnel` 模式下入口节点会按 `peerPolicy` 选择出口节点。
+
 ### POST `/api/v1/agent/connections`
 
 节点上报在线连接和真实 IP 识别结果。

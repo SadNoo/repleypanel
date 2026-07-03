@@ -43,6 +43,8 @@ REPLEYPASS_AGENT_REGION=exit \
 - 两个设备在面板中显示为在线。
 - 入口 Agent 日志出现规则监听记录。
 - 出口 Agent 日志出现 tunnel connected。
+- 入口 Agent 拉到的规则 `mode` 为 `reverse_tunnel`，`entry.enabled` 为 `true`，`tunnel.peerDeviceIds` 包含出口设备。
+- 出口 Agent 拉到的规则 `mode` 为 `exit_only` 或角色为 `exit`，不会启动入口监听。
 - 客户端连接入口端口后，流量能到达最终目标服务。
 - 在线 IP 页面能看到连接记录。
 - reverse tunnel open 元数据包含：

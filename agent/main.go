@@ -76,9 +76,39 @@ type controlEnvelope struct {
 }
 
 type agentRule struct {
-	Role        string      `json:"role"`
-	Rule        forwardRule `json:"rule"`
-	ExitDevices []device    `json:"exitDevices"`
+	Role        string            `json:"role"`
+	Mode        string            `json:"mode"`
+	Rule        forwardRule       `json:"rule"`
+	Entry       agentEntryConfig  `json:"entry"`
+	Exit        agentExitConfig   `json:"exit"`
+	Tunnel      agentTunnelConfig `json:"tunnel"`
+	ExitDevices []device          `json:"exitDevices"`
+}
+
+type agentEntryConfig struct {
+	Enabled           bool   `json:"enabled"`
+	ListenHost        string `json:"listenHost"`
+	ListenPort        string `json:"listenPort"`
+	ListenAddr        string `json:"listenAddr"`
+	Protocol          string `json:"protocol"`
+	ProxyProtocol     string `json:"proxyProtocol"`
+	ProxyProtocolMode string `json:"proxyProtocolMode"`
+}
+
+type agentExitConfig struct {
+	Enabled           bool   `json:"enabled"`
+	TargetHost        string `json:"targetHost"`
+	TargetPort        string `json:"targetPort"`
+	TargetAddr        string `json:"targetAddr"`
+	ProxyProtocol     string `json:"proxyProtocol"`
+	ProxyProtocolMode string `json:"proxyProtocolMode"`
+}
+
+type agentTunnelConfig struct {
+	Enabled       bool     `json:"enabled"`
+	PeerPolicy    string   `json:"peerPolicy"`
+	PeerDeviceIDs []int    `json:"peerDeviceIds"`
+	ExitDevices   []device `json:"exitDevices"`
 }
 
 type forwardRule struct {
@@ -631,7 +661,7 @@ func (m *relayManager) apply(parent context.Context, envelope controlEnvelope) e
 	}
 	desired := map[int]agentRule{}
 	for _, item := range envelope.Rules {
-		if item.Role != "entry" && item.Role != "entry_exit" {
+		if !item.entryEnabled() || item.effectiveMode() == "exit_only" {
 			continue
 		}
 		if !item.Rule.Enabled {
@@ -642,7 +672,7 @@ func (m *relayManager) apply(parent context.Context, envelope controlEnvelope) e
 
 	for id, relay := range m.relays {
 		item, ok := desired[id]
-		if !ok || relay.key != relayKey(item.Rule) {
+		if !ok || relay.key != relayKey(item) {
 			relay.cancel()
 			delete(m.relays, id)
 		}
@@ -653,7 +683,7 @@ func (m *relayManager) apply(parent context.Context, envelope controlEnvelope) e
 			continue
 		}
 		ctx, cancel := context.WithCancel(parent)
-		relay := &runningRelay{key: relayKey(item.Rule), rule: item.Rule, cancel: cancel}
+		relay := &runningRelay{key: relayKey(item), rule: item.runtimeRule(), cancel: cancel}
 		if err := m.startRelay(ctx, item); err != nil {
 			cancel()
 			log.Printf("skip rule id=%d name=%s: %v", item.Rule.ID, item.Rule.Name, err)
@@ -668,12 +698,83 @@ func (m *relayManager) apply(parent context.Context, envelope controlEnvelope) e
 	return nil
 }
 
-func relayKey(rule forwardRule) string {
-	return strings.Join([]string{rule.Protocol, rule.ListenHost, rule.ListenPort, rule.TargetHost, rule.TargetPort, rule.ProxyProtocolMode}, "|")
+func (item agentRule) entryEnabled() bool {
+	if item.Entry.Enabled {
+		return true
+	}
+	return item.Role == "entry" || item.Role == "entry_exit"
+}
+
+func (item agentRule) effectiveMode() string {
+	mode := strings.ToLower(strings.TrimSpace(item.Mode))
+	mode = strings.ReplaceAll(mode, "-", "_")
+	if mode != "" {
+		return mode
+	}
+	if item.Role == "exit" {
+		return "exit_only"
+	}
+	switch normalizeProtocol(item.Rule.Protocol) {
+	case "ws", "wss", "reverse", "reverse-tunnel":
+		return "reverse_tunnel"
+	default:
+		return "direct"
+	}
+}
+
+func (item agentRule) runtimeRule() forwardRule {
+	rule := item.Rule
+	if item.Entry.ListenHost != "" {
+		rule.ListenHost = item.Entry.ListenHost
+	}
+	if item.Entry.ListenPort != "" {
+		rule.ListenPort = item.Entry.ListenPort
+	}
+	if item.Entry.Protocol != "" {
+		rule.Protocol = item.Entry.Protocol
+	}
+	if item.Entry.ProxyProtocol != "" {
+		rule.ProxyProtocol = item.Entry.ProxyProtocol
+	}
+	if item.Entry.ProxyProtocolMode != "" {
+		rule.ProxyProtocolMode = item.Entry.ProxyProtocolMode
+	}
+	if item.Exit.TargetHost != "" {
+		rule.TargetHost = item.Exit.TargetHost
+	}
+	if item.Exit.TargetPort != "" {
+		rule.TargetPort = item.Exit.TargetPort
+	}
+	if item.Exit.ProxyProtocol != "" {
+		rule.ProxyProtocol = item.Exit.ProxyProtocol
+	}
+	if item.Exit.ProxyProtocolMode != "" {
+		rule.ProxyProtocolMode = item.Exit.ProxyProtocolMode
+	}
+	return rule
+}
+
+func (item agentRule) tunnelExitDevices() []device {
+	if len(item.Tunnel.ExitDevices) > 0 {
+		return item.Tunnel.ExitDevices
+	}
+	return item.ExitDevices
+}
+
+func relayKey(item agentRule) string {
+	rule := item.runtimeRule()
+	return strings.Join([]string{item.effectiveMode(), rule.Protocol, rule.ListenHost, rule.ListenPort, rule.TargetHost, rule.TargetPort, rule.ProxyProtocol, rule.ProxyProtocolMode}, "|")
 }
 
 func (m *relayManager) startRelay(ctx context.Context, item agentRule) error {
-	rule := item.Rule
+	rule := item.runtimeRule()
+	mode := item.effectiveMode()
+	if mode == "reverse_tunnel" {
+		return m.startReverseTunnelRelay(ctx, item)
+	}
+	if mode == "exit_only" {
+		return nil
+	}
 	protocol := normalizeProtocol(rule.Protocol)
 	switch protocol {
 	case "tcp", "tls", "tls-passthrough":
@@ -684,24 +785,25 @@ func (m *relayManager) startRelay(ctx context.Context, item agentRule) error {
 		return m.startHTTPConnectProxy(ctx, rule)
 	case "socks5", "socks":
 		return m.startSOCKS5Proxy(ctx, rule)
-	case "ws", "wss", "reverse", "reverse-tunnel":
-		return m.startReverseTunnelRelay(ctx, item)
 	default:
 		return fmt.Errorf("unsupported protocol %q", rule.Protocol)
 	}
 }
 
 func (m *relayManager) startReverseTunnelRelay(ctx context.Context, item agentRule) error {
-	rule := item.Rule
+	rule := item.runtimeRule()
 	listenAddr, err := listenAddress(rule)
 	if err != nil {
 		return err
 	}
-	targetAddr, err := targetAddress(rule)
-	if err != nil {
-		return err
+	targetAddr := strings.TrimSpace(item.Exit.TargetAddr)
+	if targetAddr == "" {
+		targetAddr, err = targetAddress(rule)
+		if err != nil {
+			return err
+		}
 	}
-	peerID := selectExitDevice(item.ExitDevices)
+	peerID := selectExitDevice(item.tunnelExitDevices())
 	if peerID == 0 {
 		return fmt.Errorf("rule %d has no exit device candidate", rule.ID)
 	}

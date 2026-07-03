@@ -203,6 +203,42 @@ type agentConnectionReport struct {
 	Remark          string `json:"remark"`
 }
 
+type agentRulePayload struct {
+	Role        string            `json:"role"`
+	Mode        string            `json:"mode"`
+	Rule        forwardRule       `json:"rule"`
+	Entry       agentEntryConfig  `json:"entry"`
+	Exit        agentExitConfig   `json:"exit"`
+	Tunnel      agentTunnelConfig `json:"tunnel"`
+	ExitDevices []device          `json:"exitDevices"`
+}
+
+type agentEntryConfig struct {
+	Enabled           bool   `json:"enabled"`
+	ListenHost        string `json:"listenHost"`
+	ListenPort        string `json:"listenPort"`
+	ListenAddr        string `json:"listenAddr"`
+	Protocol          string `json:"protocol"`
+	ProxyProtocol     string `json:"proxyProtocol"`
+	ProxyProtocolMode string `json:"proxyProtocolMode"`
+}
+
+type agentExitConfig struct {
+	Enabled           bool   `json:"enabled"`
+	TargetHost        string `json:"targetHost"`
+	TargetPort        string `json:"targetPort"`
+	TargetAddr        string `json:"targetAddr"`
+	ProxyProtocol     string `json:"proxyProtocol"`
+	ProxyProtocolMode string `json:"proxyProtocolMode"`
+}
+
+type agentTunnelConfig struct {
+	Enabled       bool     `json:"enabled"`
+	PeerPolicy    string   `json:"peerPolicy"`
+	PeerDeviceIDs []int    `json:"peerDeviceIds"`
+	ExitDevices   []device `json:"exitDevices"`
+}
+
 type shopPlan struct {
 	ID          int    `json:"id"`
 	Sort        int    `json:"sort"`
@@ -2199,21 +2235,23 @@ func (s *server) agentConfig(w http.ResponseWriter, r *http.Request, item device
 	}))
 }
 
-func (s *server) agentRules(item device) ([]map[string]interface{}, error) {
+func (s *server) agentRules(item device) ([]agentRulePayload, error) {
 	rules, err := s.listRules()
 	if err != nil {
 		return nil, err
 	}
-	var result []map[string]interface{}
+	var result []agentRulePayload
 	for _, rule := range rules {
 		if !rule.Enabled || rule.Status == "已暂停" {
 			continue
 		}
 		role := ""
-		if rule.EntryGroupID == item.GroupID || (rule.EntryGroupID == 0 && rule.EntryGroupName == item.GroupName) {
+		entryMatch := rule.EntryGroupID == item.GroupID || (rule.EntryGroupID == 0 && rule.EntryGroupName == item.GroupName)
+		exitMatch := rule.ExitGroupID == item.GroupID || (rule.ExitGroupID == 0 && rule.ExitGroupName == item.GroupName)
+		if entryMatch {
 			role = "entry"
 		}
-		if rule.ExitGroupID == item.GroupID || (rule.ExitGroupID == 0 && rule.ExitGroupName == item.GroupName) {
+		if exitMatch {
 			if role == "entry" {
 				role = "entry_exit"
 			} else {
@@ -2223,16 +2261,94 @@ func (s *server) agentRules(item device) ([]map[string]interface{}, error) {
 		if role == "" {
 			continue
 		}
+		mode := agentRuleMode(rule, role)
 		exitDevices := []device{}
-		if role == "entry" || role == "entry_exit" {
+		if mode == "reverse_tunnel" && (role == "entry" || role == "entry_exit") {
 			exitDevices, err = s.devicesByGroup(rule.ExitGroupID, rule.ExitGroupName)
 			if err != nil {
 				return nil, err
 			}
 		}
-		result = append(result, map[string]interface{}{"role": role, "rule": rule, "exitDevices": exitDevices})
+		result = append(result, agentRulePayload{
+			Role:        role,
+			Mode:        mode,
+			Rule:        rule,
+			Entry:       agentEntryForRule(rule, role),
+			Exit:        agentExitForRule(rule, role),
+			Tunnel:      agentTunnelForRule(mode, exitDevices),
+			ExitDevices: exitDevices,
+		})
 	}
 	return result, nil
+}
+
+func agentRuleMode(rule forwardRule, role string) string {
+	if role == "exit" {
+		return "exit_only"
+	}
+	switch normalizeAgentProtocol(rule.Protocol) {
+	case "ws", "wss", "reverse", "reverse-tunnel":
+		return "reverse_tunnel"
+	default:
+		return "direct"
+	}
+}
+
+func agentEntryForRule(rule forwardRule, role string) agentEntryConfig {
+	enabled := role == "entry" || role == "entry_exit"
+	return agentEntryConfig{
+		Enabled:           enabled,
+		ListenHost:        rule.ListenHost,
+		ListenPort:        rule.ListenPort,
+		ListenAddr:        joinHostPortIfPossible(rule.ListenHost, firstPort(rule.ListenPort)),
+		Protocol:          rule.Protocol,
+		ProxyProtocol:     rule.Proxy,
+		ProxyProtocolMode: rule.ProxyProtocolMode,
+	}
+}
+
+func agentExitForRule(rule forwardRule, role string) agentExitConfig {
+	enabled := role == "exit" || role == "entry_exit"
+	return agentExitConfig{
+		Enabled:           enabled,
+		TargetHost:        rule.TargetHost,
+		TargetPort:        rule.TargetPort,
+		TargetAddr:        joinHostPortIfPossible(rule.TargetHost, firstPort(rule.TargetPort)),
+		ProxyProtocol:     rule.Proxy,
+		ProxyProtocolMode: rule.ProxyProtocolMode,
+	}
+}
+
+func agentTunnelForRule(mode string, exitDevices []device) agentTunnelConfig {
+	peerIDs := make([]int, 0, len(exitDevices))
+	for _, item := range exitDevices {
+		peerIDs = append(peerIDs, item.ID)
+	}
+	return agentTunnelConfig{
+		Enabled:       mode == "reverse_tunnel",
+		PeerPolicy:    "first_online",
+		PeerDeviceIDs: peerIDs,
+		ExitDevices:   exitDevices,
+	}
+}
+
+func normalizeAgentProtocol(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, " ", "-")
+	switch value {
+	case "tls-入站", "tls":
+		return "tls-passthrough"
+	default:
+		return value
+	}
+}
+
+func joinHostPortIfPossible(host string, port string) string {
+	port = strings.TrimSpace(port)
+	if port == "" {
+		return ""
+	}
+	return net.JoinHostPort(strings.TrimSpace(host), port)
 }
 
 func (s *server) devicesByGroup(groupID int, groupName string) ([]device, error) {

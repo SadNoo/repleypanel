@@ -128,7 +128,7 @@ REPLEYPASS_HEALTH_SCHEDULER_SEC=10 go run .
 - token 默认有效期为 30 天，可在签发时传入 `ttlHours` 或 `expiresAt`。
 - 每次重新签发 token 都会覆盖旧 token 哈希，旧 token 立即失效。
 - 禁用设备无法注册、心跳、拉取配置、上报连接或接入 tunnel。
-- `/api/v1/agent/config` 只返回当前设备所在入口/出口组相关的规则。
+- `/api/v1/agent/config` 只返回当前设备所在入口/出口组相关的规则，并显式下发 `mode`、`entry`、`exit`、`tunnel` 配置。
 - tunnel open 必须携带 `ruleId` 与 `targetAddr` 元数据；控制面会校验来源设备属于入口组、目标设备属于出口组、规则启用且目标地址匹配规则后才允许转发。
 
 资源风格别名：
