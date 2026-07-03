@@ -98,7 +98,29 @@
 
 ### POST `/api/v1/devices/:id/agent-token`
 
-管理员生成节点 Agent Token。明文 token 只在本次响应返回，数据库仅保存哈希。
+管理员生成节点 Agent Token。明文 token 只在本次响应返回，数据库仅保存哈希、过期时间和轮换时间。重新签发会覆盖旧 token，旧 token 立即失效。
+
+请求：
+
+```json
+{
+  "ttlHours": 720,
+  "expiresAt": "<optional-rfc3339-time>"
+}
+```
+
+响应：
+
+```json
+{
+  "success": true,
+  "data": {
+    "token": "<agent-token>",
+    "expiresAt": "<rfc3339-time>",
+    "shownOnce": true
+  }
+}
+```
 
 ## Node Agent
 
@@ -133,6 +155,21 @@ Authorization: Bearer <agent_token>
 
 节点拉取当前配置，返回设备信息、`configVersion`、与该设备组相关的规则，以及绑定到该设备的健康检查配置。
 
+控制面只返回当前设备所在入口/出口组相关的规则；纯出口角色不会收到无关出口候选设备列表。响应会包含当前节点配置作用域：
+
+```json
+{
+  "configVersion": 1,
+  "scope": {
+    "deviceId": 1,
+    "groupId": 1,
+    "groupName": "entry-group",
+    "deviceType": "entry"
+  },
+  "rules": []
+}
+```
+
 ### POST `/api/v1/agent/connections`
 
 节点上报在线连接和真实 IP 识别结果。
@@ -165,7 +202,7 @@ Upgrade: repleypass-tunnel
 Authorization: Bearer <agent_token>
 ```
 
-升级后使用 RepleyPass 二进制帧进行 stream 多路复用。控制面只按源设备和目标设备转发帧，用于 reverse tunnel、WS/WSS 隧道和跨节点入口到出口转发。
+升级后使用 RepleyPass 二进制帧进行 stream 多路复用。tunnel open 必须携带 `ruleId` 与 `targetAddr` 元数据；控制面会校验来源设备属于入口组、目标设备属于出口组、规则启用且目标地址匹配规则后才允许转发。
 
 ## Device Groups
 

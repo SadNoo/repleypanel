@@ -24,14 +24,14 @@ import (
 )
 
 type config struct {
-	ControlURL       string
-	Token            string
-	AdvertiseAddress string
-	Region           string
-	Version          string
-	ConfigInterval   time.Duration
+	ControlURL        string
+	Token             string
+	AdvertiseAddress  string
+	Region            string
+	Version           string
+	ConfigInterval    time.Duration
 	HeartbeatInterval time.Duration
-	ReportInterval   time.Duration
+	ReportInterval    time.Duration
 }
 
 type apiClient struct {
@@ -68,17 +68,17 @@ type device struct {
 }
 
 type controlEnvelope struct {
-	Device        device       `json:"device"`
-	ConfigVersion int          `json:"configVersion"`
-	Rules         []agentRule  `json:"rules"`
+	Device        device      `json:"device"`
+	ConfigVersion int         `json:"configVersion"`
+	Rules         []agentRule `json:"rules"`
 	GeneratedAt   string      `json:"generatedAt"`
 	ServerTime    string      `json:"serverTime"`
 }
 
 type agentRule struct {
-	Role        string        `json:"role"`
-	Rule        forwardRule   `json:"rule"`
-	ExitDevices []device      `json:"exitDevices"`
+	Role        string      `json:"role"`
+	Rule        forwardRule `json:"rule"`
+	ExitDevices []device    `json:"exitDevices"`
 }
 
 type forwardRule struct {
@@ -124,9 +124,9 @@ type connectionReport struct {
 }
 
 type connectionReporter struct {
-	mu      sync.Mutex
-	active  map[string]connectionReport
-	total   int64
+	mu     sync.Mutex
+	active map[string]connectionReport
+	total  int64
 }
 
 type relayManager struct {
@@ -135,6 +135,7 @@ type relayManager struct {
 	tunnel   *tunnelClient
 	mu       sync.Mutex
 	relays   map[int]*runningRelay
+	version  int
 }
 
 type runningRelay struct {
@@ -162,13 +163,13 @@ type tunnelClient struct {
 }
 
 type tunnelStream struct {
-	id       uint64
-	peerID   int
-	client   *tunnelClient
-	incoming chan []byte
-	closed   chan struct{}
+	id        uint64
+	peerID    int
+	client    *tunnelClient
+	incoming  chan []byte
+	closed    chan struct{}
 	closeOnce sync.Once
-	readBuf  []byte
+	readBuf   []byte
 }
 
 type streamOpenPayload struct {
@@ -625,6 +626,9 @@ func (m *relayManager) apply(parent context.Context, envelope controlEnvelope) e
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if envelope.ConfigVersion > 0 && envelope.ConfigVersion == m.version {
+		return nil
+	}
 	desired := map[int]agentRule{}
 	for _, item := range envelope.Rules {
 		if item.Role != "entry" && item.Role != "entry_exit" {
@@ -643,6 +647,7 @@ func (m *relayManager) apply(parent context.Context, envelope controlEnvelope) e
 			delete(m.relays, id)
 		}
 	}
+	applyFailed := false
 	for id, item := range desired {
 		if _, ok := m.relays[id]; ok {
 			continue
@@ -652,9 +657,13 @@ func (m *relayManager) apply(parent context.Context, envelope controlEnvelope) e
 		if err := m.startRelay(ctx, item); err != nil {
 			cancel()
 			log.Printf("skip rule id=%d name=%s: %v", item.Rule.ID, item.Rule.Name, err)
+			applyFailed = true
 			continue
 		}
 		m.relays[id] = relay
+	}
+	if envelope.ConfigVersion > 0 && !applyFailed {
+		m.version = envelope.ConfigVersion
 	}
 	return nil
 }

@@ -10,7 +10,7 @@ Go 后端用于承接复刻前端，兼容参考站已观察到的 `/api/v1` 路
 
 健康检查用于记录设备、规则或服务探针配置，支持真实 TCP/HTTP/HTTPS 探测、后台定时调度，保存每次检查结果、延迟和错误信息，并把失败/告警状态汇总到仪表盘。
 
-节点 Agent 使用设备 token 鉴权，后台通过 `POST /api/v1/devices/{id}/agent-token` 生成 token，数据库仅保存哈希。Agent 端使用 `Authorization: Bearer <token>` 调用注册、心跳、配置拉取和连接上报接口。
+节点 Agent 使用设备 token 鉴权，后台通过 `POST /api/v1/devices/{id}/agent-token` 生成 token，数据库仅保存哈希、过期时间和轮换时间。Agent 端使用 `Authorization: Bearer <token>` 调用注册、心跳、配置拉取、连接上报和 tunnel 接口。
 
 ## 本地运行
 
@@ -44,7 +44,7 @@ REPLEYPASS_HEALTH_SCHEDULER_SEC=10 go run .
 - 默认 SQLite：`./repleypass.db`
 - 线上 SQLite：`/var/lib/repleypass/repleypass.db`
 - 表：`users`、`sessions`、`forward_rules`、`device_groups`、`devices`、`online_ips`、`health_checks`、`health_check_results`、`user_groups`、`plans`、`orders`、`redeem_codes`、`kv_settings`、`audit_logs`
-- `devices` 已包含 Agent 字段：`agent_token_hash`、`agent_registered_at`、`config_version`
+- `devices` 已包含 Agent 字段：`agent_token_hash`、`agent_registered_at`、`agent_token_expires_at`、`agent_token_rotated_at`、`config_version`
 
 ## 已实现接口
 
@@ -122,6 +122,14 @@ REPLEYPASS_HEALTH_SCHEDULER_SEC=10 go run .
 - `GET /api/v1/logs/audit`
 
 更多兼容路径见 `main.go`。
+
+## Agent 安全约束
+
+- token 默认有效期为 30 天，可在签发时传入 `ttlHours` 或 `expiresAt`。
+- 每次重新签发 token 都会覆盖旧 token 哈希，旧 token 立即失效。
+- 禁用设备无法注册、心跳、拉取配置、上报连接或接入 tunnel。
+- `/api/v1/agent/config` 只返回当前设备所在入口/出口组相关的规则。
+- tunnel open 必须携带 `ruleId` 与 `targetAddr` 元数据；控制面会校验来源设备属于入口组、目标设备属于出口组、规则启用且目标地址匹配规则后才允许转发。
 
 资源风格别名：
 

@@ -24,6 +24,7 @@ RepleyPass Agent 是节点侧客户端后端，用于连接控制面、拉取规
   - reverse tunnel
   - stream 多路复用
   - 入口节点到出口节点跨节点转发
+  - tunnel open 携带规则、目标和真实来源元数据，由控制面校验后转发
 
 ## 运行
 

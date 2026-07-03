@@ -27,6 +27,7 @@ import (
 )
 
 const sessionCookieName = "rp_session"
+const defaultAgentTokenTTL = 30 * 24 * time.Hour
 
 type response struct {
 	Success   bool        `json:"success"`
@@ -93,13 +94,13 @@ type forwardRule struct {
 }
 
 type auditLog struct {
-	ID        int    `json:"id"`
-	Actor     string `json:"actor"`
-	Action    string `json:"action"`
-	Resource  string `json:"resource"`
-	ResourceID int   `json:"resourceId"`
-	Message   string `json:"message"`
-	CreatedAt string `json:"createdAt"`
+	ID         int    `json:"id"`
+	Actor      string `json:"actor"`
+	Action     string `json:"action"`
+	Resource   string `json:"resource"`
+	ResourceID int    `json:"resourceId"`
+	Message    string `json:"message"`
+	CreatedAt  string `json:"createdAt"`
 }
 
 type onlineIP struct {
@@ -165,26 +166,28 @@ type deviceGroup struct {
 }
 
 type device struct {
-	ID                int    `json:"id"`
-	Name              string `json:"name"`
-	GroupID           int    `json:"groupId"`
-	GroupName         string `json:"groupName"`
-	Type              string `json:"type"`
-	Status            string `json:"status"`
-	Address           string `json:"address"`
-	Region            string `json:"region"`
-	Version           string `json:"version"`
-	Load              string `json:"load"`
-	LatencyMs         int    `json:"latencyMs"`
-	ConnectionCount   int    `json:"connectionCount"`
-	InboundTraffic    string `json:"inboundTraffic"`
-	OutboundTraffic   string `json:"outboundTraffic"`
-	LastHeartbeat     string `json:"lastHeartbeat"`
-	LastSeen          string `json:"lastSeen"`
-	Enabled           bool   `json:"enabled"`
-	AgentRegisteredAt string `json:"agentRegisteredAt"`
-	ConfigVersion     int    `json:"configVersion"`
-	Remark            string `json:"remark"`
+	ID                  int    `json:"id"`
+	Name                string `json:"name"`
+	GroupID             int    `json:"groupId"`
+	GroupName           string `json:"groupName"`
+	Type                string `json:"type"`
+	Status              string `json:"status"`
+	Address             string `json:"address"`
+	Region              string `json:"region"`
+	Version             string `json:"version"`
+	Load                string `json:"load"`
+	LatencyMs           int    `json:"latencyMs"`
+	ConnectionCount     int    `json:"connectionCount"`
+	InboundTraffic      string `json:"inboundTraffic"`
+	OutboundTraffic     string `json:"outboundTraffic"`
+	LastHeartbeat       string `json:"lastHeartbeat"`
+	LastSeen            string `json:"lastSeen"`
+	Enabled             bool   `json:"enabled"`
+	AgentRegisteredAt   string `json:"agentRegisteredAt"`
+	AgentTokenExpiresAt string `json:"agentTokenExpiresAt"`
+	AgentTokenRotatedAt string `json:"agentTokenRotatedAt"`
+	ConfigVersion       int    `json:"configVersion"`
+	Remark              string `json:"remark"`
 }
 
 type agentConnectionReport struct {
@@ -217,7 +220,7 @@ type order struct {
 	ID         string `json:"id"`
 	User       string `json:"user"`
 	CreatedAt  string `json:"createdAt"`
-	PaidAt      string `json:"paidAt"`
+	PaidAt     string `json:"paidAt"`
 	Info       string `json:"info"`
 	Amount     string `json:"amount"`
 	Type       string `json:"type"`
@@ -241,16 +244,18 @@ type userGroup struct {
 }
 
 type server struct {
-	db             *sql.DB
-	startedAt      time.Time
-	dbPath         string
+	db            *sql.DB
+	startedAt     time.Time
+	dbPath        string
 	healthCheckMu sync.Mutex
-	tunnels        *tunnelHub
+	tunnels       *tunnelHub
 }
 
 type tunnelHub struct {
-	mu    sync.RWMutex
-	conns map[int]*tunnelPeer
+	mu       sync.RWMutex
+	conns    map[int]*tunnelPeer
+	routes   map[string]int
+	validate tunnelValidator
 }
 
 type tunnelPeer struct {
@@ -266,6 +271,18 @@ type tunnelFrame struct {
 	TargetDeviceID uint32
 	Payload        []byte
 }
+
+type tunnelOpenPayload struct {
+	TargetAddr   string `json:"targetAddr"`
+	SourceIP     string `json:"sourceIp"`
+	SourcePort   int    `json:"sourcePort"`
+	RealIPSource string `json:"realIpSource"`
+	RuleID       int    `json:"ruleId"`
+	RuleName     string `json:"ruleName"`
+	Protocol     string `json:"protocol"`
+}
+
+type tunnelValidator func(sourceDeviceID int, frame tunnelFrame) error
 
 const (
 	tunnelFrameOpen  byte = 1
@@ -283,7 +300,8 @@ func main() {
 	}
 	defer db.Close()
 
-	s := &server{db: db, startedAt: time.Now(), dbPath: dbPath, tunnels: newTunnelHub()}
+	s := &server{db: db, startedAt: time.Now(), dbPath: dbPath}
+	s.tunnels = newTunnelHub(s.validateTunnelOpen)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.health)
 	mux.HandleFunc("/api/v1/", s.api)
@@ -416,6 +434,8 @@ func migrate(db *sql.DB) error {
 			enabled INTEGER NOT NULL DEFAULT 1,
 			agent_token_hash TEXT NOT NULL DEFAULT '',
 			agent_registered_at TEXT NOT NULL DEFAULT '',
+			agent_token_expires_at TEXT NOT NULL DEFAULT '',
+			agent_token_rotated_at TEXT NOT NULL DEFAULT '',
 			config_version INTEGER NOT NULL DEFAULT 1,
 			remark TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -548,23 +568,23 @@ func migrate(db *sql.DB) error {
 
 func migrateForwardRuleColumns(db *sql.DB) error {
 	columns := map[string]string{
-		"entry_group_id":       "INTEGER NOT NULL DEFAULT 0",
-		"entry_group_name":     "TEXT NOT NULL DEFAULT ''",
-		"listen_host":          "TEXT NOT NULL DEFAULT ''",
-		"listen_port":          "TEXT NOT NULL DEFAULT ''",
-		"exit_group_id":        "INTEGER NOT NULL DEFAULT 0",
-		"exit_group_name":      "TEXT NOT NULL DEFAULT ''",
-		"target_host":          "TEXT NOT NULL DEFAULT ''",
-		"target_port":          "TEXT NOT NULL DEFAULT ''",
-		"strategy":             "TEXT NOT NULL DEFAULT 'fallback'",
-		"today_traffic":        "TEXT NOT NULL DEFAULT '0.00 GiB'",
-		"sync_status":          "TEXT NOT NULL DEFAULT '未同步'",
-		"proxy_protocol_mode":  "TEXT NOT NULL DEFAULT 'send'",
-		"current_connections":  "INTEGER NOT NULL DEFAULT 0",
-		"error_count":          "INTEGER NOT NULL DEFAULT 0",
-		"last_hit_at":          "TEXT NOT NULL DEFAULT ''",
-		"enabled":              "INTEGER NOT NULL DEFAULT 1",
-		"remark":               "TEXT NOT NULL DEFAULT ''",
+		"entry_group_id":      "INTEGER NOT NULL DEFAULT 0",
+		"entry_group_name":    "TEXT NOT NULL DEFAULT ''",
+		"listen_host":         "TEXT NOT NULL DEFAULT ''",
+		"listen_port":         "TEXT NOT NULL DEFAULT ''",
+		"exit_group_id":       "INTEGER NOT NULL DEFAULT 0",
+		"exit_group_name":     "TEXT NOT NULL DEFAULT ''",
+		"target_host":         "TEXT NOT NULL DEFAULT ''",
+		"target_port":         "TEXT NOT NULL DEFAULT ''",
+		"strategy":            "TEXT NOT NULL DEFAULT 'fallback'",
+		"today_traffic":       "TEXT NOT NULL DEFAULT '0.00 GiB'",
+		"sync_status":         "TEXT NOT NULL DEFAULT '未同步'",
+		"proxy_protocol_mode": "TEXT NOT NULL DEFAULT 'send'",
+		"current_connections": "INTEGER NOT NULL DEFAULT 0",
+		"error_count":         "INTEGER NOT NULL DEFAULT 0",
+		"last_hit_at":         "TEXT NOT NULL DEFAULT ''",
+		"enabled":             "INTEGER NOT NULL DEFAULT 1",
+		"remark":              "TEXT NOT NULL DEFAULT ''",
 	}
 	for name, definition := range columns {
 		ok, err := columnExists(db, "forward_rules", name)
@@ -594,9 +614,11 @@ func migrateForwardRuleColumns(db *sql.DB) error {
 
 func migrateDeviceColumns(db *sql.DB) error {
 	columns := map[string]string{
-		"agent_token_hash":    "TEXT NOT NULL DEFAULT ''",
-		"agent_registered_at": "TEXT NOT NULL DEFAULT ''",
-		"config_version":      "INTEGER NOT NULL DEFAULT 1",
+		"agent_token_hash":       "TEXT NOT NULL DEFAULT ''",
+		"agent_registered_at":    "TEXT NOT NULL DEFAULT ''",
+		"agent_token_expires_at": "TEXT NOT NULL DEFAULT ''",
+		"agent_token_rotated_at": "TEXT NOT NULL DEFAULT ''",
+		"config_version":         "INTEGER NOT NULL DEFAULT 1",
 	}
 	for name, definition := range columns {
 		ok, err := columnExists(db, "devices", name)
@@ -1865,18 +1887,55 @@ func (s *server) issueAgentToken(w http.ResponseWriter, r *http.Request, id int)
 		writeError(w, r, http.StatusNotFound, "device not found")
 		return
 	}
+	expiresAt, err := decodeAgentTokenExpiry(r)
+	if err != nil {
+		writeError(w, r, http.StatusBadRequest, err.Error())
+		return
+	}
 	token, err := randomToken()
 	if err != nil {
 		writeError(w, r, http.StatusInternalServerError, "create agent token failed")
 		return
 	}
-	if _, err := s.db.Exec(`UPDATE devices SET agent_token_hash = ?, config_version = config_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, hashAgentToken(token), id); err != nil {
+	rotatedAt := time.Now().UTC().Format(time.RFC3339)
+	if _, err := s.db.Exec(`UPDATE devices SET agent_token_hash = ?, agent_token_expires_at = ?, agent_token_rotated_at = ?, config_version = config_version + 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`, hashAgentToken(token), expiresAt.Format(time.RFC3339), rotatedAt, id); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "save agent token failed")
 		return
 	}
 	s.logAudit(r, "issue_agent_token", "device", id, "生成节点 Agent Token")
 	device, _ := s.deviceByID(id)
-	writeOK(w, r, map[string]interface{}{"token": token, "device": device, "shownOnce": true})
+	writeOK(w, r, map[string]interface{}{"token": token, "device": device, "expiresAt": expiresAt.Format(time.RFC3339), "shownOnce": true})
+}
+
+func decodeAgentTokenExpiry(r *http.Request) (time.Time, error) {
+	expiresAt := time.Now().UTC().Add(defaultAgentTokenTTL)
+	if r.Body == nil {
+		return expiresAt, nil
+	}
+	var payload struct {
+		TTLHours  int    `json:"ttlHours"`
+		ExpiresAt string `json:"expiresAt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		return time.Time{}, errors.New("invalid json")
+	}
+	if payload.ExpiresAt != "" {
+		parsed, err := time.Parse(time.RFC3339, strings.TrimSpace(payload.ExpiresAt))
+		if err != nil {
+			return time.Time{}, errors.New("expiresAt must be RFC3339")
+		}
+		if !parsed.After(time.Now().UTC()) {
+			return time.Time{}, errors.New("expiresAt must be in the future")
+		}
+		return parsed.UTC(), nil
+	}
+	if payload.TTLHours > 0 {
+		if payload.TTLHours > 24*90 {
+			return time.Time{}, errors.New("ttlHours must be 2160 or less")
+		}
+		expiresAt = time.Now().UTC().Add(time.Duration(payload.TTLHours) * time.Hour)
+	}
+	return expiresAt, nil
 }
 
 func (s *server) heartbeatDevice(r *http.Request, id int) error {
@@ -1989,10 +2048,10 @@ func (s *server) deviceByID(id int) (device, error) {
 	return item, err
 }
 
-const deviceSelectSQL = `SELECT id, name, group_id, group_name, type, status, address, region, version, load, latency_ms, connection_count, inbound_traffic, outbound_traffic, last_heartbeat, last_seen, enabled, agent_registered_at, config_version, remark FROM devices`
+const deviceSelectSQL = `SELECT id, name, group_id, group_name, type, status, address, region, version, load, latency_ms, connection_count, inbound_traffic, outbound_traffic, last_heartbeat, last_seen, enabled, agent_registered_at, agent_token_expires_at, agent_token_rotated_at, config_version, remark FROM devices`
 
 func scanDevice(scanner sqlScanner, item *device) error {
-	return scanner.Scan(&item.ID, &item.Name, &item.GroupID, &item.GroupName, &item.Type, &item.Status, &item.Address, &item.Region, &item.Version, &item.Load, &item.LatencyMs, &item.ConnectionCount, &item.InboundTraffic, &item.OutboundTraffic, &item.LastHeartbeat, &item.LastSeen, &item.Enabled, &item.AgentRegisteredAt, &item.ConfigVersion, &item.Remark)
+	return scanner.Scan(&item.ID, &item.Name, &item.GroupID, &item.GroupName, &item.Type, &item.Status, &item.Address, &item.Region, &item.Version, &item.Load, &item.LatencyMs, &item.ConnectionCount, &item.InboundTraffic, &item.OutboundTraffic, &item.LastHeartbeat, &item.LastSeen, &item.Enabled, &item.AgentRegisteredAt, &item.AgentTokenExpiresAt, &item.AgentTokenRotatedAt, &item.ConfigVersion, &item.Remark)
 }
 
 func (s *server) recountDeviceGroupOnline() error {
@@ -2035,7 +2094,8 @@ func (s *server) currentAgentDevice(r *http.Request) (device, error) {
 		return device{}, errors.New("agent token required")
 	}
 	var item device
-	err := scanDevice(s.db.QueryRow(deviceSelectSQL+` WHERE agent_token_hash = ? AND enabled = 1`, hashAgentToken(token)), &item)
+	now := time.Now().UTC().Format(time.RFC3339)
+	err := scanDevice(s.db.QueryRow(deviceSelectSQL+` WHERE agent_token_hash = ? AND enabled = 1 AND (agent_token_expires_at = '' OR agent_token_expires_at > ?)`, hashAgentToken(token), now), &item)
 	return item, err
 }
 
@@ -2083,7 +2143,7 @@ func (s *server) agentHeartbeat(w http.ResponseWriter, r *http.Request, item dev
 	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	status := firstNonEmpty(payload.Status, "online")
-	if _, err := s.db.Exec(`UPDATE devices SET status = ?, load = ?, latency_ms = ?, connection_count = ?, inbound_traffic = ?, outbound_traffic = ?, last_heartbeat = ?, last_seen = ?, enabled = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+	if _, err := s.db.Exec(`UPDATE devices SET status = ?, load = ?, latency_ms = ?, connection_count = ?, inbound_traffic = ?, outbound_traffic = ?, last_heartbeat = ?, last_seen = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
 		status, firstNonEmpty(payload.Load, item.Load, "0%"), payload.LatencyMs, payload.ConnectionCount, firstNonEmpty(payload.InboundTraffic, item.InboundTraffic, "0.00 GiB"), firstNonEmpty(payload.OutboundTraffic, item.OutboundTraffic, "0.00 GiB"), now, now, item.ID); err != nil {
 		writeError(w, r, http.StatusInternalServerError, "heartbeat failed")
 		return
@@ -2129,7 +2189,13 @@ func (s *server) agentConfig(w http.ResponseWriter, r *http.Request, item device
 	writeOK(w, r, agentEnvelope(item, map[string]interface{}{
 		"rules":        rules,
 		"healthChecks": checks,
-		"generatedAt":   time.Now().UTC().Format(time.RFC3339),
+		"scope": map[string]interface{}{
+			"deviceId":   item.ID,
+			"groupId":    item.GroupID,
+			"groupName":  item.GroupName,
+			"deviceType": item.Type,
+		},
+		"generatedAt": time.Now().UTC().Format(time.RFC3339),
 	}))
 }
 
@@ -2157,9 +2223,12 @@ func (s *server) agentRules(item device) ([]map[string]interface{}, error) {
 		if role == "" {
 			continue
 		}
-		exitDevices, err := s.devicesByGroup(rule.ExitGroupID, rule.ExitGroupName)
-		if err != nil {
-			return nil, err
+		exitDevices := []device{}
+		if role == "entry" || role == "entry_exit" {
+			exitDevices, err = s.devicesByGroup(rule.ExitGroupID, rule.ExitGroupName)
+			if err != nil {
+				return nil, err
+			}
 		}
 		result = append(result, map[string]interface{}{"role": role, "rule": rule, "exitDevices": exitDevices})
 	}
@@ -2263,8 +2332,66 @@ func (s *server) agentTunnel(w http.ResponseWriter, r *http.Request, item device
 	s.tunnels.serve(item.ID, conn)
 }
 
-func newTunnelHub() *tunnelHub {
-	return &tunnelHub{conns: map[int]*tunnelPeer{}}
+func (s *server) validateTunnelOpen(sourceDeviceID int, frame tunnelFrame) error {
+	var payload tunnelOpenPayload
+	if len(frame.Payload) == 0 || frame.Payload[0] != '{' {
+		return errors.New("tunnel open metadata is required")
+	}
+	if err := json.Unmarshal(frame.Payload, &payload); err != nil {
+		return errors.New("invalid tunnel open metadata")
+	}
+	payload.TargetAddr = strings.TrimSpace(payload.TargetAddr)
+	if payload.RuleID <= 0 {
+		return errors.New("tunnel ruleId is required")
+	}
+	if payload.TargetAddr == "" {
+		return errors.New("tunnel targetAddr is required")
+	}
+	rule, err := s.ruleByID(payload.RuleID)
+	if err != nil {
+		return errors.New("tunnel rule not found")
+	}
+	if !rule.Enabled || rule.Status == "已暂停" {
+		return errors.New("tunnel rule is disabled")
+	}
+	source, err := s.deviceByID(sourceDeviceID)
+	if err != nil || !source.Enabled {
+		return errors.New("source device is disabled")
+	}
+	target, err := s.deviceByID(int(frame.TargetDeviceID))
+	if err != nil || !target.Enabled {
+		return errors.New("target device is disabled")
+	}
+	if !deviceInRuleGroup(source, rule.EntryGroupID, rule.EntryGroupName) {
+		return errors.New("source device is not in rule entry group")
+	}
+	if !deviceInRuleGroup(target, rule.ExitGroupID, rule.ExitGroupName) {
+		return errors.New("target device is not in rule exit group")
+	}
+	if expected, ok := ruleTargetAddress(rule); ok && payload.TargetAddr != expected {
+		return errors.New("targetAddr does not match rule target")
+	}
+	return nil
+}
+
+func deviceInRuleGroup(item device, groupID int, groupName string) bool {
+	if groupID > 0 {
+		return item.GroupID == groupID
+	}
+	return groupName != "" && item.GroupName == groupName
+}
+
+func ruleTargetAddress(rule forwardRule) (string, bool) {
+	host := strings.TrimSpace(rule.TargetHost)
+	port := firstPort(rule.TargetPort)
+	if host == "" || port == "" {
+		return "", false
+	}
+	return net.JoinHostPort(host, port), true
+}
+
+func newTunnelHub(validate tunnelValidator) *tunnelHub {
+	return &tunnelHub{conns: map[int]*tunnelPeer{}, routes: map[string]int{}, validate: validate}
 }
 
 func (h *tunnelHub) serve(deviceID int, conn net.Conn) {
@@ -2292,9 +2419,32 @@ func (h *tunnelHub) serve(deviceID int, conn net.Conn) {
 			log.Printf("drop tunnel frame without target device=%d stream=%d", deviceID, frame.StreamID)
 			continue
 		}
+		if frame.Type == tunnelFrameOpen {
+			if err := h.openRoute(deviceID, frame); err != nil {
+				log.Printf("reject tunnel open from=%d to=%d stream=%d: %v", deviceID, frame.TargetDeviceID, frame.StreamID, err)
+				_ = peer.write(tunnelFrame{Type: tunnelFrameClose, StreamID: frame.StreamID, SourceDeviceID: frame.TargetDeviceID, TargetDeviceID: uint32(deviceID), Payload: []byte(err.Error())})
+				continue
+			}
+		} else if frame.Type == tunnelFrameData || frame.Type == tunnelFrameClose {
+			if err := h.validateRoute(deviceID, frame); err != nil {
+				log.Printf("drop tunnel frame from=%d to=%d stream=%d: %v", deviceID, frame.TargetDeviceID, frame.StreamID, err)
+				_ = peer.write(tunnelFrame{Type: tunnelFrameClose, StreamID: frame.StreamID, SourceDeviceID: frame.TargetDeviceID, TargetDeviceID: uint32(deviceID), Payload: []byte(err.Error())})
+				continue
+			}
+		} else {
+			log.Printf("drop unsupported tunnel frame type=%d device=%d stream=%d", frame.Type, deviceID, frame.StreamID)
+			continue
+		}
 		if err := h.forward(frame); err != nil {
 			log.Printf("forward tunnel frame failed from=%d to=%d stream=%d: %v", deviceID, frame.TargetDeviceID, frame.StreamID, err)
 			_ = peer.write(tunnelFrame{Type: tunnelFrameClose, StreamID: frame.StreamID, SourceDeviceID: frame.TargetDeviceID, TargetDeviceID: uint32(deviceID), Payload: []byte(err.Error())})
+			if frame.Type == tunnelFrameOpen {
+				h.closeRoute(deviceID, int(frame.TargetDeviceID), frame.StreamID)
+			}
+			continue
+		}
+		if frame.Type == tunnelFrameClose {
+			h.closeRoute(deviceID, int(frame.TargetDeviceID), frame.StreamID)
 		}
 	}
 }
@@ -2313,8 +2463,58 @@ func (h *tunnelHub) unregister(deviceID int, peer *tunnelPeer) {
 	defer h.mu.Unlock()
 	if h.conns[deviceID] == peer {
 		delete(h.conns, deviceID)
+		h.dropDeviceRoutesLocked(deviceID)
 	}
 	log.Printf("agent tunnel disconnected device=%d", deviceID)
+}
+
+func (h *tunnelHub) openRoute(deviceID int, frame tunnelFrame) error {
+	if h.validate != nil {
+		if err := h.validate(deviceID, frame); err != nil {
+			return err
+		}
+	}
+	targetID := int(frame.TargetDeviceID)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.conns[targetID] == nil {
+		return fmt.Errorf("target device %d tunnel offline", targetID)
+	}
+	h.routes[tunnelRouteKey(deviceID, frame.StreamID)] = targetID
+	h.routes[tunnelRouteKey(targetID, frame.StreamID)] = deviceID
+	return nil
+}
+
+func (h *tunnelHub) validateRoute(deviceID int, frame tunnelFrame) error {
+	h.mu.RLock()
+	targetID, ok := h.routes[tunnelRouteKey(deviceID, frame.StreamID)]
+	h.mu.RUnlock()
+	if !ok {
+		return errors.New("unknown tunnel stream")
+	}
+	if targetID != int(frame.TargetDeviceID) {
+		return fmt.Errorf("invalid tunnel route target %d", frame.TargetDeviceID)
+	}
+	return nil
+}
+
+func (h *tunnelHub) closeRoute(deviceID int, targetID int, streamID uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.routes, tunnelRouteKey(deviceID, streamID))
+	delete(h.routes, tunnelRouteKey(targetID, streamID))
+}
+
+func (h *tunnelHub) dropDeviceRoutesLocked(deviceID int) {
+	for key, targetID := range h.routes {
+		if strings.HasPrefix(key, fmt.Sprintf("%d:", deviceID)) || targetID == deviceID {
+			delete(h.routes, key)
+		}
+	}
+}
+
+func tunnelRouteKey(deviceID int, streamID uint64) string {
+	return fmt.Sprintf("%d:%d", deviceID, streamID)
 }
 
 func (h *tunnelHub) forward(frame tunnelFrame) error {
@@ -2999,7 +3199,7 @@ func executeTCPHealthCheck(ctx context.Context, check healthCheck, timeout time.
 	dialer := net.Dialer{Timeout: timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
-		return "failed", elapsedMs(started), err.Error()
+		return "failed", elapsedMs(started), healthProbeError(err, "TCP 探针连接失败")
 	}
 	_ = conn.Close()
 	latency := elapsedMs(started)
@@ -3028,7 +3228,7 @@ func executeHTTPHealthCheck(ctx context.Context, check healthCheck, protocol str
 	resp, err := client.Do(req)
 	latency := elapsedMs(started)
 	if err != nil {
-		return "failed", latency, err.Error()
+		return "failed", latency, healthProbeError(err, "HTTP 探针请求失败")
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
@@ -3061,6 +3261,24 @@ func healthCheckURL(check healthCheck, protocol string) (string, error) {
 	}
 	u := url.URL{Scheme: protocol, Host: host, Path: path}
 	return u.String(), nil
+}
+
+func healthProbeError(err error, fallback string) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return "探针请求超时"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "探针主机解析失败"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "探针请求超时"
+	}
+	return fallback
 }
 
 func elapsedMs(started time.Time) int {
@@ -3565,6 +3783,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstPort(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	parts := strings.Split(value, ",")
+	return strings.TrimSpace(parts[0])
 }
 
 func splitEndpoint(value string) (string, string) {

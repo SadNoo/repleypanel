@@ -115,3 +115,4 @@ curl http://localhost:8080/api/v1/system/node/status
 - [参考面板已观察接口](docs/reference-api-observed.md)
 - [Go API 后端](backend/README.md)
 - [节点 Agent](agent/README.md)
+- [Agent 双节点联调基础流程](docs/agent-relay-smoke-test.md)
